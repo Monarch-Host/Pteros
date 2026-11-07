@@ -4,6 +4,7 @@
 #
 #   sudo bash install-pterodactyl.sh --fqdn panel.example.com --email you@example.com
 #
+# Cloudflare Tunnel: add  --tunnel --node-fqdn node.example.com [--cf-token TOKEN]
 # Optional: --tz Asia/Kolkata  --admin-user admin  --admin-pass 'Secret123'  --node-name Node1
 # Credentials are printed at the end and saved to /root/pterodactyl-credentials.txt
 
@@ -21,8 +22,12 @@ die()  { echo -e "${R}[x]${N} $*" >&2; exit 1; }
 
 FQDN=""; EMAIL=""; TZ_NAME="Asia/Kolkata"
 ADMIN_USER="admin"; ADMIN_PASS=""; NODE_NAME="Node1"
+TUNNEL=0; NODE_FQDN=""; CF_TOKEN=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --tunnel)     TUNNEL=1; shift ;;            # Cloudflare Tunnel mode (no certbot, no public 80/443)
+    --node-fqdn)  NODE_FQDN="$2"; shift 2 ;;    # tunnel mode: hostname that routes to Wings
+    --cf-token)   CF_TOKEN="$2"; shift 2 ;;     # tunnel mode: optional, installs cloudflared with this token
     --fqdn)       FQDN="$2"; shift 2 ;;
     --email)      EMAIL="$2"; shift 2 ;;
     --tz)         TZ_NAME="$2"; shift 2 ;;
@@ -32,7 +37,13 @@ while [[ $# -gt 0 ]]; do
     *) die "Unknown option: $1" ;;
   esac
 done
-[[ -n "$FQDN" && -n "$EMAIL" ]] || die "Usage: bash $0 --fqdn panel.example.com --email you@example.com"
+[[ -n "$FQDN" && -n "$EMAIL" ]] || die "Usage: bash $0 --fqdn panel.example.com --email you@example.com [--tunnel --node-fqdn node.example.com [--cf-token TOKEN]]"
+if [[ $TUNNEL -eq 1 ]]; then
+  [[ -n "$NODE_FQDN" ]] || die "Tunnel mode needs --node-fqdn (a second hostname routed to Wings, e.g. node.example.com)"
+  [[ "$NODE_FQDN" != "$FQDN" ]] || die "--node-fqdn must differ from --fqdn"
+else
+  NODE_FQDN="$FQDN"
+fi
 
 rand() { tr -dc 'A-Za-z0-9' </dev/urandom | head -c "${1:-24}"; }
 DB_PASS="$(rand 28)"
@@ -51,7 +62,7 @@ apt-get install -y software-properties-common curl ca-certificates gnupg lsb-rel
 # ---------------- DNS check ----------------
 SERVER_IP="$(curl -fsS https://api.ipify.org || true)"
 DNS_IP="$(dig +short "$FQDN" | tail -n1 || true)"
-if [[ -n "$SERVER_IP" && "$SERVER_IP" != "$DNS_IP" ]]; then
+if [[ $TUNNEL -eq 0 && -n "$SERVER_IP" && "$SERVER_IP" != "$DNS_IP" ]]; then
   die "DNS for ${FQDN} points to '${DNS_IP:-nothing}', but this server is ${SERVER_IP}.
     Create an A record -> ${SERVER_IP} (DNS-only / grey cloud if on Cloudflare), wait a minute, re-run."
 fi
@@ -67,20 +78,33 @@ systemctl enable --now mariadb redis-server php8.3-fpm
 log "Installing Composer"
 curl -fsSL https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
 
-# ---------------- SSL ----------------
+# ---------------- SSL / firewall ----------------
 log "Opening firewall"
-ufw allow 22/tcp >/dev/null; ufw allow 80/tcp >/dev/null; ufw allow 443/tcp >/dev/null
-ufw allow 8080/tcp >/dev/null; ufw allow 2022/tcp >/dev/null
+ufw allow 22/tcp >/dev/null; ufw allow 2022/tcp >/dev/null
+if [[ $TUNNEL -eq 0 ]]; then
+  ufw allow 80/tcp >/dev/null; ufw allow 443/tcp >/dev/null; ufw allow 8080/tcp >/dev/null
+fi
 ufw --force enable >/dev/null
 
-log "Issuing Let's Encrypt certificate"
 systemctl stop nginx || true
 rm -f /etc/nginx/sites-enabled/default
-certbot certonly --standalone --non-interactive --agree-tos -m "$EMAIL" -d "$FQDN" \
-  --pre-hook "systemctl stop nginx" --post-hook "systemctl start nginx"
-mkdir -p /etc/letsencrypt/renewal-hooks/deploy
-printf '#!/bin/sh\nsystemctl restart wings 2>/dev/null || true\n' > /etc/letsencrypt/renewal-hooks/deploy/wings-restart.sh
-chmod +x /etc/letsencrypt/renewal-hooks/deploy/wings-restart.sh
+if [[ $TUNNEL -eq 0 ]]; then
+  log "Issuing Let's Encrypt certificate"
+  certbot certonly --standalone --non-interactive --agree-tos -m "$EMAIL" -d "$FQDN" \
+    --pre-hook "systemctl stop nginx" --post-hook "systemctl start nginx"
+  mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+  printf '#!/bin/sh\nsystemctl restart wings 2>/dev/null || true\n' > /etc/letsencrypt/renewal-hooks/deploy/wings-restart.sh
+  chmod +x /etc/letsencrypt/renewal-hooks/deploy/wings-restart.sh
+else
+  log "Tunnel mode: skipping Let's Encrypt (Cloudflare terminates TLS)"
+  if [[ -n "$CF_TOKEN" ]]; then
+    log "Installing cloudflared"
+    case "$(uname -m)" in x86_64) CFA=amd64 ;; aarch64) CFA=arm64 ;; *) die "Unsupported arch" ;; esac
+    curl -fsSL -o /tmp/cloudflared.deb "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CFA}.deb"
+    dpkg -i /tmp/cloudflared.deb
+    cloudflared service install "$CF_TOKEN"
+  fi
+fi
 
 # ---------------- database ----------------
 log "Creating database"
@@ -194,6 +218,48 @@ server {
 }
 EOF
 sed -i "s/__FQDN__/${FQDN}/g" /etc/nginx/sites-available/pterodactyl.conf
+if [[ $TUNNEL -eq 1 ]]; then
+  # Cloudflare terminates TLS; nginx only listens on localhost:80
+  cat > /etc/nginx/sites-available/pterodactyl.conf <<'EOF'
+server {
+    listen 127.0.0.1:80;
+    server_name __FQDN__;
+    root /var/www/pterodactyl/public;
+    index index.php;
+
+    access_log /var/log/nginx/pterodactyl.app-access.log;
+    error_log  /var/log/nginx/pterodactyl.app-error.log error;
+
+    client_max_body_size 100m;
+    client_body_timeout 120s;
+    sendfile off;
+
+    location / {
+        try_files $uri $uri/ /index.php?$query_string;
+    }
+    location ~ \.php$ {
+        fastcgi_split_path_info ^(.+\.php)(/.+)$;
+        fastcgi_pass unix:/run/php/php8.3-fpm.sock;
+        fastcgi_index index.php;
+        include fastcgi_params;
+        fastcgi_param HTTPS on;
+        fastcgi_param PHP_VALUE "upload_max_filesize = 100M \n post_max_size=100M";
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        fastcgi_param HTTP_PROXY "";
+        fastcgi_intercept_errors off;
+        fastcgi_buffer_size 16k;
+        fastcgi_buffers 4 16k;
+        fastcgi_connect_timeout 300;
+        fastcgi_send_timeout 300;
+        fastcgi_read_timeout 300;
+    }
+    location ~ /\.ht {
+        deny all;
+    }
+}
+EOF
+  sed -i "s/__FQDN__/${FQDN}/g" /etc/nginx/sites-available/pterodactyl.conf
+fi
 ln -sf /etc/nginx/sites-available/pterodactyl.conf /etc/nginx/sites-enabled/pterodactyl.conf
 nginx -t
 
@@ -226,10 +292,10 @@ php artisan p:location:make --no-interaction --short=main --long="Main Location"
 LOC_ID=$(mysql -N -u root panel -e "SELECT id FROM locations ORDER BY id DESC LIMIT 1;")
 php artisan p:node:make --no-interaction \
   --name="$NODE_NAME" --description="Auto-created node" --locationId="$LOC_ID" \
-  --fqdn="$FQDN" --public=1 --scheme=https --proxy=0 --maintenance=0 \
+  --fqdn="$NODE_FQDN" --public=1 --scheme=https --proxy="$TUNNEL" --maintenance=0 \
   --maxMemory="$MEM_MB" --overallocateMemory=0 \
   --maxDisk="$DISK_MB" --overallocateDisk=0 \
-  --uploadSize=100 --daemonListeningPort=8080 --daemonSFTPPort=2022 \
+  --uploadSize=100 --daemonListeningPort="$([[ $TUNNEL -eq 1 ]] && echo 443 || echo 8080)" --daemonSFTPPort=2022 \
   --daemonBase=/var/lib/pterodactyl/volumes
 NODE_ID=$(mysql -N -u root panel -e "SELECT id FROM nodes ORDER BY id DESC LIMIT 1;")
 [[ -n "$NODE_ID" ]] || die "Node creation failed"
@@ -237,6 +303,11 @@ NODE_ID=$(mysql -N -u root panel -e "SELECT id FROM nodes ORDER BY id DESC LIMIT
 php artisan p:node:configuration "$NODE_ID" > /etc/pterodactyl/config.yml
 [[ -s /etc/pterodactyl/config.yml ]] || die "Could not generate Wings config"
 chmod 600 /etc/pterodactyl/config.yml
+if [[ $TUNNEL -eq 1 ]]; then
+  # Panel talks to https://NODE_FQDN:443 via Cloudflare; Wings itself listens on plain HTTP 8080 locally
+  sed -i '0,/^  port: [0-9]*/s//  port: 8080/' /etc/pterodactyl/config.yml
+  grep -q '^  port: 8080' /etc/pterodactyl/config.yml || die "Could not set Wings api port to 8080 in config.yml"
+fi
 
 cat > /etc/systemd/system/wings.service <<'EOF'
 [Unit]
@@ -272,7 +343,7 @@ Email     : ${EMAIL}
 Password  : ${ADMIN_PASS}
 DB user   : pterodactyl
 DB pass   : ${DB_PASS}
-Node      : ${NODE_NAME} (id ${NODE_ID}) -> https://${FQDN}:8080
+Node      : ${NODE_NAME} (id ${NODE_ID}) -> ${NODE_FQDN}
 EOF
 chmod 600 /root/pterodactyl-credentials.txt
 
@@ -280,4 +351,9 @@ echo
 log "ALL DONE"
 cat /root/pterodactyl-credentials.txt
 echo
+if [[ $TUNNEL -eq 1 ]]; then
+  warn "TUNNEL MODE: in Cloudflare Zero Trust > Tunnels > Public hostnames, add:"
+  warn "   ${FQDN}       ->  HTTP  localhost:80"
+  warn "   ${NODE_FQDN}  ->  HTTP  localhost:8080"
+fi
 warn "Saved to /root/pterodactyl-credentials.txt. Node should show a green heart in Admin > Nodes."
