@@ -45,7 +45,7 @@ else
   NODE_FQDN="$FQDN"
 fi
 
-rand() { tr -dc 'A-Za-z0-9' </dev/urandom | head -c "${1:-24}"; }
+rand() { local s; s="$(openssl rand -hex 32)"; echo "${s:0:${1:-24}}"; }
 DB_PASS="$(rand 28)"
 [[ -n "$ADMIN_PASS" ]] || ADMIN_PASS="$(rand 16)"
 PANEL_DIR=/var/www/pterodactyl
